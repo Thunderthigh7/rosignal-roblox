@@ -16,9 +16,24 @@
 	insert can be retried without a new code, and a paired place can reinstall
 	its scripts at any time with Repair setup.
 
+	Layout:
+	  1. Constants, services and state
+	  2. UI construction
+	  3. UI state helpers
+	  4. Protected (busy-guarded) actions
+	  5. Networking
+	  6. Script installation
+	  7. Pairing and repair
+	  8. Map collection and export
+	  9. Event wiring and startup
+
 	Publish this as a plugin from Roblox Studio (right-click the script ->
 	Save as Local Plugin, or Publish as Plugin to the Creator Store).
 ]]
+
+-- =============================================================================
+-- 1. Constants, services and state
+-- =============================================================================
 
 local HttpService = game:GetService("HttpService")
 local ServerScriptService = game:GetService("ServerScriptService")
@@ -30,8 +45,25 @@ local PAIR_URL = BASE_URL .. "/api/public/pair"
 
 -- How many parts one export may contain before we stop walking the tree.
 local MAX_BOXES = 60000
+-- Keep Studio responsive on very large places: yield every this many instances.
+local SCAN_YIELD_EVERY = 4000
+
 local SETTING_KEY = "rosignal_link_" .. tostring(game.GameId)
 local CACHE_KEY = "rosignal_pending_" .. tostring(game.GameId)
+
+local COLOR = {
+	background = Color3.fromRGB(24, 26, 31),
+	field = Color3.fromRGB(15, 17, 21),
+	surface = Color3.fromRGB(37, 41, 49),
+	divider = Color3.fromRGB(45, 49, 57),
+	accent = Color3.fromRGB(56, 189, 168),
+	onAccent = Color3.fromRGB(8, 12, 14),
+	text = Color3.fromRGB(226, 232, 240),
+	bright = Color3.fromRGB(240, 244, 248),
+	muted = Color3.fromRGB(148, 163, 184),
+	faint = Color3.fromRGB(100, 116, 139),
+	error = Color3.fromRGB(248, 113, 113),
+}
 
 local toolbar = plugin:CreateToolbar("RoSignal")
 local button = toolbar:CreateButton("Setup RoSignal", "Connect this place to RoSignal", "rbxassetid://0")
@@ -43,7 +75,9 @@ local widget = plugin:CreateDockWidgetPluginGui(
 )
 widget.Title = "Setup RoSignal"
 
--- UI --------------------------------------------------------------------------
+-- =============================================================================
+-- 2. UI construction
+-- =============================================================================
 
 local function label(parent, order, text, size)
 	local item = Instance.new("TextLabel")
@@ -55,9 +89,18 @@ local function label(parent, order, text, size)
 	item.TextWrapped = true
 	item.Font = Enum.Font.GothamMedium
 	item.TextSize = 13
-	item.TextColor3 = Color3.fromRGB(226, 232, 240)
+	item.TextColor3 = COLOR.text
 	item.Text = text
 	item.Parent = parent
+	return item
+end
+
+--- A smaller, dimmer line of supporting text.
+local function noteLabel(parent, order, text, size)
+	local item = label(parent, order, text, size)
+	item.Font = Enum.Font.Gotham
+	item.TextSize = 12
+	item.TextColor3 = COLOR.muted
 	return item
 end
 
@@ -65,11 +108,11 @@ local function textButton(parent, order, text, primary)
 	local item = Instance.new("TextButton")
 	item.LayoutOrder = order
 	item.Size = UDim2.new(1, 0, 0, primary and 34 or 30)
-	item.BackgroundColor3 = primary and Color3.fromRGB(56, 189, 168) or Color3.fromRGB(37, 41, 49)
+	item.BackgroundColor3 = primary and COLOR.accent or COLOR.surface
 	item.BorderSizePixel = 0
 	item.Font = Enum.Font.GothamMedium
 	item.TextSize = primary and 14 or 13
-	item.TextColor3 = primary and Color3.fromRGB(8, 12, 14) or Color3.fromRGB(226, 232, 240)
+	item.TextColor3 = primary and COLOR.onAccent or COLOR.text
 	item.AutoButtonColor = true
 	item.Text = text
 	item.Parent = parent
@@ -79,7 +122,7 @@ end
 local function buildUi()
 	local frame = Instance.new("Frame")
 	frame.Size = UDim2.fromScale(1, 1)
-	frame.BackgroundColor3 = Color3.fromRGB(24, 26, 31)
+	frame.BackgroundColor3 = COLOR.background
 	frame.BorderSizePixel = 0
 	frame.Parent = widget
 
@@ -95,21 +138,17 @@ local function buildUi()
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
 	layout.Parent = frame
 
-	local state = label(frame, 1, "Checking connection...", 20)
-	state.Font = Enum.Font.Gotham
-	state.TextSize = 12
-	state.TextColor3 = Color3.fromRGB(148, 163, 184)
-
-	local title = label(frame, 2, "Paste the pairing code from your RoSignal setup page.", 34)
+	local state = noteLabel(frame, 1, "Checking connection...", 20)
+	label(frame, 2, "Paste the pairing code from your RoSignal setup page.", 34)
 
 	local box = Instance.new("TextBox")
 	box.LayoutOrder = 3
 	box.Size = UDim2.new(1, 0, 0, 34)
-	box.BackgroundColor3 = Color3.fromRGB(15, 17, 21)
+	box.BackgroundColor3 = COLOR.field
 	box.BorderSizePixel = 0
 	box.Font = Enum.Font.RobotoMono
 	box.TextSize = 16
-	box.TextColor3 = Color3.fromRGB(240, 244, 248)
+	box.TextColor3 = COLOR.bright
 	box.PlaceholderText = "PAIRING CODE"
 	box.Text = ""
 	box.ClearTextOnFocus = false
@@ -122,7 +161,7 @@ local function buildUi()
 	local divider = Instance.new("Frame")
 	divider.LayoutOrder = 7
 	divider.Size = UDim2.new(1, 0, 0, 1)
-	divider.BackgroundColor3 = Color3.fromRGB(45, 49, 57)
+	divider.BackgroundColor3 = COLOR.divider
 	divider.BorderSizePixel = 0
 	divider.Parent = frame
 
@@ -130,15 +169,10 @@ local function buildUi()
 	local exportSelection = textButton(frame, 9, "Export selection")
 	local exportPlace = textButton(frame, 10, "Export whole place")
 
-	local status = label(frame, 11, "", 74)
-	status.Font = Enum.Font.Gotham
-	status.TextSize = 12
-	status.TextColor3 = Color3.fromRGB(148, 163, 184)
-
-	local version = label(frame, 12, "RoSignal plugin v" .. PLUGIN_VERSION, 16)
-	version.Font = Enum.Font.Gotham
+	local status = noteLabel(frame, 11, "", 74)
+	local version = noteLabel(frame, 12, "RoSignal plugin v" .. PLUGIN_VERSION, 16)
 	version.TextSize = 11
-	version.TextColor3 = Color3.fromRGB(100, 116, 139)
+	version.TextColor3 = COLOR.faint
 
 	return {
 		state = state,
@@ -154,11 +188,25 @@ end
 
 local ui = buildUi()
 
+-- Every button that must be disabled while an action runs.
+local actionButtons = {
+	ui.go,
+	ui.repairButton,
+	ui.retryButton,
+	ui.exportSelection,
+	ui.exportPlace,
+}
+
+-- =============================================================================
+-- 3. UI state helpers
+-- =============================================================================
+
 local function say(text, isError)
 	ui.status.Text = text or ""
-	ui.status.TextColor3 = isError and Color3.fromRGB(248, 113, 113) or Color3.fromRGB(148, 163, 184)
+	ui.status.TextColor3 = isError and COLOR.error or COLOR.muted
 end
 
+--- The saved pairing for this place, or nil when it has never been paired.
 local function readLink()
 	local link = plugin:GetSetting(SETTING_KEY)
 	if type(link) == "table" and type(link.key) == "string" then
@@ -169,37 +217,35 @@ end
 
 local function refreshState(extra)
 	local link = readLink()
-	local text
-	if link then
-		text = ("Paired to %s."):format(link.gameName or "this place")
-	else
-		text = "Not paired yet."
-	end
+	local text = link and ("Paired to %s."):format(link.gameName or "this place") or "Not paired yet."
 	ui.state.Text = extra and (text .. " " .. extra) or text
 	ui.repairButton.Visible = link ~= nil
 end
 
--- Never let a click leave the plugin in a stuck state ---------------------------
+-- =============================================================================
+-- 4. Protected (busy-guarded) actions
+-- =============================================================================
 
 local busy = false
 
---- Runs `action` with every button disabled, and always restores them, even if
---- the action raises. Any unexpected Lua error becomes a readable status line.
+local function setButtonsActive(active)
+	for _, item in ipairs(actionButtons) do
+		item.Active = active
+	end
+end
+
 local function protect(labelText, target, action)
 	if busy then
 		say("Still working on the last action — one moment.")
 		return
 	end
+
 	busy = true
 	local originalText = target and target.Text or nil
 	if target then
 		target.Text = labelText
 	end
-	ui.go.Active = false
-	ui.repairButton.Active = false
-	ui.retryButton.Active = false
-	ui.exportSelection.Active = false
-	ui.exportPlace.Active = false
+	setButtonsActive(false)
 
 	local ok, err = pcall(action)
 
@@ -207,11 +253,7 @@ local function protect(labelText, target, action)
 	if target and originalText then
 		target.Text = originalText
 	end
-	ui.go.Active = true
-	ui.repairButton.Active = true
-	ui.retryButton.Active = true
-	ui.exportSelection.Active = true
-	ui.exportPlace.Active = true
+	setButtonsActive(true)
 	refreshState()
 
 	if not ok then
@@ -219,9 +261,10 @@ local function protect(labelText, target, action)
 	end
 end
 
--- Networking -------------------------------------------------------------------
+-- =============================================================================
+-- 5. Networking
+-- =============================================================================
 
---- Turns a failed HttpService call into the one instruction that actually fixes it.
 local function describeHttpFailure(message)
 	message = tostring(message or ""):lower()
 	if message:find("not enabled") or message:find("http requests") then
@@ -245,9 +288,9 @@ local function request(options)
 	pcall(function()
 		decoded = HttpService:JSONDecode(res.Body)
 	end)
+
 	if not res.Success then
-		return nil, (decoded and decoded.error) or ("RoSignal replied with an error (" .. res.StatusCode .. ")."),
-			decoded
+		return nil, (decoded and decoded.error) or ("RoSignal replied with an error (" .. res.StatusCode .. ")."), decoded
 	end
 	if type(decoded) ~= "table" then
 		return nil, "RoSignal sent something unexpected. Try again in a moment."
@@ -255,8 +298,15 @@ local function request(options)
 	return decoded, nil
 end
 
---- Cheap GET. Doing this first is what makes Studio's permission prompt appear
---- before a pairing code can be burned.
+local function postPair(payload)
+	return request({
+		Url = PAIR_URL,
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode(payload),
+	})
+end
+
 local function checkConnection(quiet)
 	local data, err = request({ Url = PAIR_URL, Method = "GET" })
 	if not data then
@@ -271,10 +321,10 @@ local function checkConnection(quiet)
 	return true
 end
 
--- Script insertion --------------------------------------------------------------
+-- =============================================================================
+-- 6. Script installation
+-- =============================================================================
 
---- Write a script into `parent` (ServerScriptService by default). Developer-owned
---- files (keepExisting) are created once and never touched again.
 local function writeScript(className, name, source, keepExisting, parent)
 	if type(name) ~= "string" or type(source) ~= "string" then
 		error("RoSignal sent an incomplete script payload", 0)
@@ -302,7 +352,7 @@ local function writeScript(className, name, source, keepExisting, parent)
 	if existing then
 		if className == "ModuleScript" and not keepExisting then
 			local wrote = pcall(function()
-				existing.Source = source -- runtime is always refreshed
+				existing.Source = source
 			end)
 			if not wrote then
 				error(
@@ -335,29 +385,50 @@ local function writeScript(className, name, source, keepExisting, parent)
 	return created, true
 end
 
---- Applies a pairing/repair payload to the place. Safe to run repeatedly.
+local function rememberLink(data)
+	if not (data.gameKey and data.mapUrl) then
+		return
+	end
+	pcall(function()
+		plugin:SetSetting(SETTING_KEY, { key = data.gameKey, mapUrl = data.mapUrl, gameName = data.gameName })
+	end)
+end
+
+local function cachePayload(data)
+	pcall(function()
+		plugin:SetSetting(CACHE_KEY, data)
+	end)
+end
+
+local function clearCachedPayload()
+	pcall(function()
+		plugin:SetSetting(CACHE_KEY, nil)
+	end)
+end
+
+local function cachedPayload()
+	local cached = plugin:GetSetting(CACHE_KEY)
+	if type(cached) == "table" and type(cached.moduleSource) == "string" then
+		return cached
+	end
+	return nil
+end
+
 local function applyPayload(data)
 	writeScript("ModuleScript", data.moduleName, data.moduleSource)
+
 	if data.settingsName and data.settingsSource then
 		writeScript("ModuleScript", data.settingsName, data.settingsSource, true)
 	end
+
 	local handlers, created = writeScript("Script", data.handlersName, data.handlersSource)
 
-	-- Starter demo UI lives inside the handlers script, so their entry point
-	-- stays short. It is theirs once written: we never overwrite it.
 	if handlers and data.demoName and data.demoSource then
 		writeScript("ModuleScript", data.demoName, data.demoSource, true, handlers)
 	end
 
-	if data.gameKey and data.mapUrl then
-		pcall(function()
-			plugin:SetSetting(SETTING_KEY, { key = data.gameKey, mapUrl = data.mapUrl, gameName = data.gameName })
-		end)
-	end
-	-- The payload is applied; drop the retry cache.
-	pcall(function()
-		plugin:SetSetting(CACHE_KEY, nil)
-	end)
+	rememberLink(data)
+	clearCachedPayload()
 
 	pcall(function()
 		Selection:Set({ handlers })
@@ -369,18 +440,12 @@ local function applyPayload(data)
 	)
 end
 
-local function cachedPayload()
-	local cached = plugin:GetSetting(CACHE_KEY)
-	if type(cached) == "table" and type(cached.moduleSource) == "string" then
-		return cached
-	end
-	return nil
-end
+-- =============================================================================
+-- 7. Pairing and repair
+-- =============================================================================
 
 local function runSetup()
 	protect("Setting up...", ui.go, function()
-		-- A previous attempt fetched a payload but failed to insert it: reuse it
-		-- instead of asking for another code.
 		local pendingPayload = cachedPayload()
 		if pendingPayload then
 			say("Finishing the setup that was interrupted...")
@@ -396,22 +461,13 @@ local function runSetup()
 		end
 
 		say("Talking to RoSignal...")
-		local data, err = request({
-			Url = PAIR_URL,
-			Method = "POST",
-			Headers = { ["Content-Type"] = "application/json" },
-			Body = HttpService:JSONEncode({ code = code, universeId = tostring(game.GameId) }),
-		})
+		local data, err = postPair({ code = code, universeId = tostring(game.GameId) })
 		if not data then
 			say(err, true)
 			return
 		end
 
-		-- Cache before touching the place, so a failed insert is retryable.
-		pcall(function()
-			plugin:SetSetting(CACHE_KEY, data)
-		end)
-
+		cachePayload(data)
 		applyPayload(data)
 		ui.box.Text = ""
 	end)
@@ -432,101 +488,67 @@ local function runRepair()
 		end
 
 		say("Fetching the latest scripts...")
-		local data, err = request({
-			Url = PAIR_URL,
-			Method = "POST",
-			Headers = { ["Content-Type"] = "application/json" },
-			Body = HttpService:JSONEncode({ gameKey = link.key }),
-		})
+		local data, err = postPair({ gameKey = link.key })
 		if not data then
 			say(err, true)
 			return
 		end
 
-		pcall(function()
-			plugin:SetSetting(CACHE_KEY, data)
-		end)
+		cachePayload(data)
 		applyPayload(data)
 	end)
 end
 
-ui.go.MouseButton1Click:Connect(runSetup)
-ui.repairButton.MouseButton1Click:Connect(runRepair)
-ui.retryButton.MouseButton1Click:Connect(function()
-	protect("Checking...", ui.retryButton, function()
-		checkConnection(false)
-	end)
-end)
-ui.box.FocusLost:Connect(function(enterPressed)
-	if enterPressed then
-		runSetup()
-	end
-end)
+-- =============================================================================
+-- 8. Map collection and export
+-- =============================================================================
 
-button.Click:Connect(function()
-	widget.Enabled = not widget.Enabled
-	if widget.Enabled then
-		refreshState()
-		task.spawn(function()
-			protect("Checking...", ui.retryButton, function()
-				checkConnection(true)
-			end)
-		end)
-	end
-end)
-
-refreshState()
-if cachedPayload() then
-	say("Your last setup was interrupted. Press Setup RoSignal to finish it — no new code needed.")
-end
-
--- Map export ------------------------------------------------------------------
-
--- Every rendered part becomes one axis-aligned block: centre, size, colour bucket.
 local function collect(roots)
 	local boxes = {}
 	local truncated = false
 	local scanned = 0
+
+	local function addPart(instance)
+		local size = instance.Size
+		if size.X * size.Y * size.Z < 1 then
+			return
+		end
+
+		local cf = instance.CFrame
+		local pos = cf.Position
+		local sx = math.abs(cf.RightVector.X) * size.X + math.abs(cf.UpVector.X) * size.Y + math.abs(cf.LookVector.X) * size.Z
+		local sy = math.abs(cf.RightVector.Y) * size.X + math.abs(cf.UpVector.Y) * size.Y + math.abs(cf.LookVector.Y) * size.Z
+		local sz = math.abs(cf.RightVector.Z) * size.X + math.abs(cf.UpVector.Z) * size.Y + math.abs(cf.LookVector.Z) * size.Z
+
+		local colour = instance.Color
+		local bucket = math.floor(((colour.R + colour.G + colour.B) / 3) * 7 + 0.5)
+
+		table.insert(boxes, {
+			math.floor(pos.X * 100) / 100,
+			math.floor(pos.Y * 100) / 100,
+			math.floor(pos.Z * 100) / 100,
+			math.floor(sx * 100) / 100,
+			math.floor(sy * 100) / 100,
+			math.floor(sz * 100) / 100,
+			bucket,
+		})
+	end
 
 	local function visit(instance)
 		if #boxes >= MAX_BOXES then
 			truncated = true
 			return
 		end
+
 		scanned += 1
-		-- Keep Studio responsive on very large places.
-		if scanned % 4000 == 0 then
+		if scanned % SCAN_YIELD_EVERY == 0 then
 			task.wait()
 		end
+
 		if instance:IsA("BasePart") and instance.Transparency < 1 and not instance:IsA("Terrain") then
-			local size = instance.Size
-			-- Skip specks — they add bandwidth and never read on the map.
-			if size.X * size.Y * size.Z >= 1 then
-				local cf = instance.CFrame
-				local pos = cf.Position
-				-- Axis-aligned extent of the rotated part.
-				local sx = math.abs(cf.RightVector.X) * size.X
-					+ math.abs(cf.UpVector.X) * size.Y
-					+ math.abs(cf.LookVector.X) * size.Z
-				local sy = math.abs(cf.RightVector.Y) * size.X
-					+ math.abs(cf.UpVector.Y) * size.Y
-					+ math.abs(cf.LookVector.Y) * size.Z
-				local sz = math.abs(cf.RightVector.Z) * size.X
-					+ math.abs(cf.UpVector.Z) * size.Y
-					+ math.abs(cf.LookVector.Z) * size.Z
-				local colour = instance.Color
-				local bucket = math.floor(((colour.R + colour.G + colour.B) / 3) * 7 + 0.5)
-				table.insert(boxes, {
-					math.floor(pos.X * 100) / 100,
-					math.floor(pos.Y * 100) / 100,
-					math.floor(pos.Z * 100) / 100,
-					math.floor(sx * 100) / 100,
-					math.floor(sy * 100) / 100,
-					math.floor(sz * 100) / 100,
-					bucket,
-				})
-			end
+			addPart(instance)
 		end
+
 		for _, child in ipairs(instance:GetChildren()) do
 			visit(child)
 		end
@@ -538,6 +560,18 @@ local function collect(roots)
 	return boxes, truncated
 end
 
+local function exportRoots(source)
+	if source ~= "selection" then
+		return { workspace }, game.Name
+	end
+
+	local roots = Selection:Get()
+	if #roots == 0 then
+		return nil, nil, "Select something in the Explorer first, then export."
+	end
+	return roots, roots[1].Name
+end
+
 local function exportMap(source, target)
 	protect("Exporting...", target, function()
 		local link = readLink()
@@ -546,18 +580,10 @@ local function exportMap(source, target)
 			return
 		end
 
-		local roots
-		local name
-		if source == "selection" then
-			roots = Selection:Get()
-			if #roots == 0 then
-				say("Select something in the Explorer first, then export.", true)
-				return
-			end
-			name = roots[1].Name
-		else
-			roots = { workspace }
-			name = game.Name
+		local roots, name, problem = exportRoots(source)
+		if not roots then
+			say(problem, true)
+			return
 		end
 
 		say("Reading parts...")
@@ -590,8 +616,27 @@ local function exportMap(source, target)
 			note = " Your plan's block limit trimmed the rest."
 		end
 		say(("Map updated with %d blocks. Open Analytics -> Map on RoSignal.%s"):format(stored, note))
-	end
+	end)
 end
+
+-- =============================================================================
+-- 9. Event wiring and startup
+-- =============================================================================
+
+ui.go.MouseButton1Click:Connect(runSetup)
+ui.repairButton.MouseButton1Click:Connect(runRepair)
+
+ui.retryButton.MouseButton1Click:Connect(function()
+	protect("Checking...", ui.retryButton, function()
+		checkConnection(false)
+	end)
+end)
+
+ui.box.FocusLost:Connect(function(enterPressed)
+	if enterPressed then
+		runSetup()
+	end
+end)
 
 ui.exportSelection.MouseButton1Click:Connect(function()
 	exportMap("selection", ui.exportSelection)
@@ -599,3 +644,22 @@ end)
 ui.exportPlace.MouseButton1Click:Connect(function()
 	exportMap("workspace", ui.exportPlace)
 end)
+
+button.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+	if not widget.Enabled then
+		return
+	end
+
+	refreshState()
+	task.spawn(function()
+		protect("Checking...", ui.retryButton, function()
+			checkConnection(true)
+		end)
+	end)
+end)
+
+refreshState()
+if cachedPayload() then
+	say("Your last setup was interrupted. Press Setup RoSignal to finish it — no new code needed.")
+end
